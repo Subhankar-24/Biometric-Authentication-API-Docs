@@ -1,0 +1,747 @@
+openapi: 3.0.3
+
+info:
+  title: Biometric Authentication API
+  version: 1.0.0
+  description: >
+    Complete API reference for the Flask backend for **Secure Voting**.
+
+
+    This API supports three authentication pathways:
+
+    - **Standard credential registration** (password-based, SHA-256 hashed)
+
+    - **Face Biometrics** — Powered by `face_recognition` (ResNet50 model). A 128-dimensional
+      face encoding is extracted from a Base64-encoded image and matched against the stored
+      template using Euclidean distance (tolerance: 0.50).
+
+    - **Fingerprint Biometrics** — Hardware-backed, using the Android Keystore's `BiometricPrompt`.
+      During enrollment, the device generates an RSA/EC key pair inside the Trusted Execution
+      Environment (TEE). Only the **public key** is sent to the server. During login, the device
+      signs a `payload` string with the private key (which **never leaves the device**), and the
+      server verifies the cryptographic signature.
+
+  # contact:
+  #   name: Subhankar Ghosh 
+  #   email: subhankar.gh24@gmail.com
+  
+
+# servers:
+#   - url: http://127.0.0.1:5000
+#     description: Local Development Server
+#   - url: https://your-production-url.com
+#     description: Production Server (replace with actual URL)
+
+tags:
+  - name: GENERAL
+    description: Health check and root endpoints.
+  - name: AUTHENTICATION
+    description: Standard voter registration using email, Voter ID, and password.
+  - name: FACE BIOMETRICS
+    description: >
+      Face enrollment and authentication powered by the `face_recognition` library (ResNet50).
+      Images are transmitted as Base64-encoded strings. The server extracts a 128-dimensional
+      face encoding and computes Euclidean distance against the stored template.
+  - name: FINGERPRINT BIOMETRICS
+    description: >
+      Hardware-backed fingerprint authentication using Android Keystore cryptography.
+      The public key is enrolled once; subsequent logins are verified by checking a
+      cryptographic signature produced by the device's Trusted Execution Environment (TEE).
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REUSABLE COMPONENTS
+# ─────────────────────────────────────────────────────────────────────────────
+components:
+  schemas:
+
+    # ── Generic success response (no data payload) ──
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "Operation completed successfully."
+
+    # ── Generic error response ──
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        message:
+          type: string
+          example: "A descriptive error message."
+
+    # ── /register request body ──
+    RegisterRequest:
+      type: object
+      required:
+        - full_name
+        - email
+        - voter_id
+        - password
+      properties:
+        full_name:
+          type: string
+          description: The voter's full legal name.
+          example: "John Doe"
+        email:
+          type: string
+          format: email
+          description: "A unique email address. Must not already exist in the system."
+          example: "john.doe@example.com"
+        voter_id:
+          type: string
+          description: >
+            A unique alphanumeric Voter ID string (e.g., issued by an electoral body).
+            This is used as the primary identifier across all biometric endpoints.
+          example: "VT001"
+        password:
+          type: string
+          format: password
+          description: The plaintext password. Stored as a SHA-256 hash server-side.
+          example: "StrongPass@123"
+
+    # ── /register success response ──
+    RegisterSuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "User registered successfully"
+        id:
+          type: integer
+          description: The auto-incremented internal database ID of the newly created voter record.
+          example: 7
+
+    # ── /face/register & /fingerprint/register shared request fields ──
+    VoterIdImageRequest:
+      type: object
+      required:
+        - voter_id
+        - image
+      properties:
+        voter_id:
+          type: string
+          description: >
+            The unique string Voter ID (e.g., `VT001`). The server uses this to resolve
+            the internal database ID before saving the biometric template.
+          example: "VT001"
+        image:
+          type: string
+          format: byte
+          description: >
+            A Base64-encoded JPEG or PNG image of the voter's face.
+            The string may optionally include a Data URI prefix
+            (e.g., `data:image/jpeg;base64,...`), which the server strips automatically.
+          example: "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U..."
+
+    # ── /face/login request ──
+    FaceLoginRequest:
+      type: object
+      required:
+        - voter_id
+        - image
+      properties:
+        voter_id:
+          type: string
+          description: The registered string Voter ID to authenticate against.
+          example: "VT001"
+        image:
+          type: string
+          format: byte
+          description: >
+            A Base64-encoded image of the voter's face captured at login time.
+            The server decodes this, extracts a 128-d face encoding, and computes
+            the Euclidean distance against the stored template (threshold: 0.50).
+          example: "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U..."
+
+    # ── /face/login success response ──
+    FaceLoginSuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "Face authentication successful"
+        distance:
+          type: number
+          format: float
+          description: >
+            The Euclidean distance between the submitted face encoding and the stored
+            template. A value of `0.0` indicates a perfect match. Values below the
+            threshold of `0.50` are considered a successful match.
+          example: 0.0
+
+    # ── /face/login failure response (face mismatch) ──
+    FaceLoginMismatchResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        message:
+          type: string
+          example: "Face did not match"
+        distance:
+          type: number
+          format: float
+          description: The computed distance that exceeded the tolerance threshold (0.50).
+          example: 0.68
+
+    # ── /fingerprint/register request ──
+    FingerprintRegisterRequest:
+      type: object
+      required:
+        - voter_id
+        - public_key
+      properties:
+        voter_id:
+          type: string
+          description: The registered string Voter ID.
+          example: "VT001"
+        public_key:
+          type: string
+          description: >
+            The public key string generated by the Android Keystore.
+            This is typically a PEM-encoded or DER-encoded RSA/EC public key.
+            The server stores this as a BLOB in the `biometric_templates` table.
+            If a fingerprint template already exists for this voter, it is **overwritten**.
+          example: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2a8p..."
+
+    # ── /fingerprint/login request ──
+    FingerprintLoginRequest:
+      type: object
+      required:
+        - voter_id
+        - signature
+        - payload
+      properties:
+        voter_id:
+          type: string
+          description: The registered string Voter ID.
+          example: "VT001"
+        signature:
+          type: string
+          format: byte
+          description: >
+            A **Base64-encoded cryptographic signature** produced by the Android Keystore's
+            `BiometricPrompt`. The device signs the `payload` string using the **private key**
+            stored in its Trusted Execution Environment (TEE). The private key **never leaves
+            the device**. The server verifies this signature against the stored public key.
+          example: "MEQCIBn3zFk7Xp8LqA2vN1oJ9cRmT4yHwDsEuKiPlZ0QdVgBAiAyT3kWmX..."
+        payload:
+          type: string
+          description: >
+            The original plaintext string that was signed by the device. This is used by the
+            server as the message input during signature verification. Typically formatted as
+            a human-readable login challenge string.
+          example: "Login Request for VT001"
+
+    # ── /fingerprint/login success response ──
+    FingerprintLoginSuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          example: "Fingerprint login successful"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+paths:
+
+  # ── GENERAL ──────────────────────────────────────────────────────────────
+  /:
+    get:
+      tags:
+        - GENERAL
+      summary: Root — API Status
+      description: Returns a simple status object confirming the API is online.
+      operationId: getRoot
+      responses:
+        "200":
+          description: API is online.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "online"
+                  message:
+                    type: string
+                    example: "Welcome to the Biometric Auth API"
+                  version:
+                    type: string
+                    example: "1.0"
+
+  /health:
+    get:
+      tags:
+        - GENERAL
+      summary: Health Check
+      description: Lightweight probe to confirm the Flask server is running and reachable.
+      operationId: getHealth
+      responses:
+        "200":
+          description: Server is healthy.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  message:
+                    type: string
+                    example: "Biometric Auth API is running"
+
+  # ── AUTHENTICATION ────────────────────────────────────────────────────────
+  /register:
+    post:
+      tags:
+        - AUTHENTICATION
+      summary: Register a new voter
+      description: >
+        Creates a new voter record in the `voters` MySQL table.
+
+        - **Password storage**: The plaintext password is hashed with **SHA-256** before
+          being written to `password_hash`. The plaintext is never stored.
+
+        - **Uniqueness constraints**: Both `email` and `voter_id` columns have `UNIQUE`
+          indexes. Submitting a duplicate value for either field returns a `409 Conflict`.
+
+        - **Return value**: On success, the `id` field contains the new record's
+          auto-incremented primary key, which is useful for subsequent biometric enrollment calls.
+      operationId: registerVoter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+            example:
+              full_name: "John Doe"
+              email: "john.doe@example.com"
+              voter_id: "VT001"
+              password: "StrongPass@123"
+      responses:
+        "201":
+          description: Voter registered successfully. Returns the new record's database ID.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterSuccessResponse"
+              example:
+                success: true
+                message: "User registered successfully"
+                id: 7
+        "400":
+          description: >
+            Bad Request — One or more required fields (`full_name`, `email`, `voter_id`,
+            `password`) are missing or null.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "All fields are required"
+        "409":
+          description: >
+            Conflict — A voter with the same `email` or `voter_id` already exists.
+            Triggered by a MySQL `Duplicate entry` error on the unique indexes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "Email or Voter ID already exists"
+        "500":
+          description: Internal Server Error — Unexpected database or server failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "Unexpected error occurred."
+
+  # ── FACE BIOMETRICS ───────────────────────────────────────────────────────
+  /face/register:
+    post:
+      tags:
+        - FACE BIOMETRICS
+      summary: Enroll a voter's face template
+      description: >
+        Accepts a Base64-encoded image, extracts a **128-dimensional face encoding**
+        using the `face_recognition` library (ResNet50 backbone), serializes it with
+        `pickle`, and stores it as a `LONGBLOB` in the `biometric_templates` table.
+
+
+        **Upsert behaviour**: If a face template already exists for the voter, it is
+        **overwritten** with the new encoding. This allows re-enrollment without
+        requiring a delete step.
+
+
+        **voter_id resolution**: The endpoint accepts the human-readable string
+        Voter ID (e.g., `VT001`) and resolves it to the internal integer primary key
+        before writing the template.
+      operationId: faceRegister
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VoterIdImageRequest"
+            example:
+              voter_id: "VT001"
+              image: "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U..."
+      responses:
+        "200":
+          description: Face template enrolled (or updated) successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+              example:
+                success: true
+                message: "Face registered successfully"
+        "400":
+          description: >
+            Bad Request — Either `voter_id` or `image` is missing, or the Base64
+            image string could not be decoded into a valid image.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missing_fields:
+                  summary: Missing required fields
+                  value:
+                    success: false
+                    message: "voter_id and image are required"
+                decode_failed:
+                  summary: Image decoding failure
+                  value:
+                    success: false
+                    message: "Failed to decode image"
+        "404":
+          description: Not Found — No voter exists in the database with the given `voter_id`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "Voter not found"
+        "422":
+          description: >
+            Unprocessable Entity — The image was decoded successfully but no human
+            face was detected within it by the `face_recognition` model.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "No face detected in image"
+        "500":
+          description: Internal Server Error — Unexpected database or server failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /face/login:
+    post:
+      tags:
+        - FACE BIOMETRICS
+      summary: Authenticate a voter via face recognition
+      description: >
+        Decodes the submitted Base64 image, extracts its 128-dimensional face encoding,
+        then computes the **Euclidean distance** between it and the voter's stored template.
+
+
+        **Matching threshold**: `0.50`. If `distance <= 0.50`, authentication succeeds.
+        The exact computed `distance` float is always returned in the response body
+        for both success and failure cases.
+
+
+        **Authentication logging**: Every attempt (success or failure) is written to
+        the `authentication_logs` table with the `auth_type = 'face'`, along with
+        the caller's IP address and the computed distance.
+      operationId: faceLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FaceLoginRequest"
+            example:
+              voter_id: "VT001"
+              image: "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8U..."
+      responses:
+        "200":
+          description: >
+            Face authentication successful. The submitted face matched the stored
+            template within the distance tolerance (≤ 0.50).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FaceLoginSuccessResponse"
+              example:
+                success: true
+                message: "Face authentication successful"
+                distance: 0.0
+        "400":
+          description: >
+            Bad Request — `voter_id` or `image` is missing, or the Base64 image
+            string could not be decoded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missing_fields:
+                  summary: Missing required fields
+                  value:
+                    success: false
+                    message: "voter_id and image are required"
+                decode_failed:
+                  summary: Image decoding failure
+                  value:
+                    success: false
+                    message: "Failed to decode image"
+        "401":
+          description: >
+            Unauthorized — The submitted face encoding did not match the stored
+            template (distance exceeded the 0.50 threshold). The `distance` value
+            is returned to aid debugging.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FaceLoginMismatchResponse"
+              example:
+                success: false
+                message: "Face did not match"
+                distance: 0.68
+        "404":
+          description: >
+            Not Found — Either no voter exists with the given `voter_id`, or
+            the voter has not enrolled a face template yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                voter_not_found:
+                  summary: Voter ID does not exist
+                  value:
+                    success: false
+                    message: "Voter not found"
+                no_template:
+                  summary: No face enrolled for this voter
+                  value:
+                    success: false
+                    message: "No face registered for this user"
+        "422":
+          description: >
+            Unprocessable Entity — The image decoded successfully but the
+            `face_recognition` model found no face in the submitted image.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "No face detected in image"
+        "500":
+          description: Internal Server Error — Unexpected database or server failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # ── FINGERPRINT BIOMETRICS ────────────────────────────────────────────────
+  /fingerprint/register:
+    post:
+      tags:
+        - FINGERPRINT BIOMETRICS
+      summary: Enroll a voter's hardware public key
+      description: >
+        Stores the **public key** generated by the Android Keystore's hardware-backed
+        key generation API. This is the enrollment step for hardware fingerprint authentication.
+
+
+        **Security model**:
+
+        1. The Android device generates an RSA or EC key pair inside the device's
+           **Trusted Execution Environment (TEE)** or **Secure Enclave**, bound to
+           a successful biometric (fingerprint) prompt.
+
+        2. Only the **public key** is transmitted to and stored by the server
+           (as a UTF-8 encoded `LONGBLOB`).
+
+        3. The **private key never leaves the device hardware**.
+
+
+        **Upsert behaviour**: If a fingerprint template already exists for the voter,
+        it is **overwritten** with the new public key.
+      operationId: fingerprintRegister
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FingerprintRegisterRequest"
+            example:
+              voter_id: "VT001"
+              public_key: "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2a8p..."
+      responses:
+        "200":
+          description: Public key enrolled (or updated) successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SuccessResponse"
+              example:
+                success: true
+                message: "Fingerprint Public Key registered successfully"
+        "400":
+          description: Bad Request — `voter_id` or `public_key` is missing or null.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "voter_id and public_key are required"
+        "404":
+          description: Not Found — No voter exists with the given `voter_id`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "Voter not found"
+        "500":
+          description: Internal Server Error — Unexpected database or server failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /fingerprint/login:
+    post:
+      tags:
+        - FINGERPRINT BIOMETRICS
+      summary: Authenticate a voter via hardware fingerprint signature
+      description: >
+        Verifies a **cryptographic signature** produced by the Android Keystore's
+        `BiometricPrompt` using the voter's enrolled public key.
+
+
+        **Authentication flow**:
+
+        1. The Android app prompts the user for their fingerprint via `BiometricPrompt`.
+
+        2. On hardware confirmation, Android uses the **private key** (stored in the TEE)
+           to sign a `payload` string (e.g., `"Login Request for VT001"`).
+
+        3. The resulting **Base64-encoded signature** and the original `payload` are
+           sent to this endpoint.
+
+        4. The server retrieves the stored public key and verifies the signature
+           against the payload using RSA/EC cryptography.
+
+        5. If the signature is valid, the authentication is approved and the event
+           is logged in `authentication_logs` with `auth_type = 'fingerprint'`.
+
+      operationId: fingerprintLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FingerprintLoginRequest"
+            example:
+              voter_id: "VT001"
+              signature: "MEQCIBn3zFk7Xp8LqA2vN1oJ9cRmT4yHwDsEuKiPlZ0QdVgBAiAyT3kWmX..."
+              payload: "Login Request for VT001"
+      responses:
+        "200":
+          description: >
+            Fingerprint authentication successful. The cryptographic signature was
+            verified against the stored public key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FingerprintLoginSuccessResponse"
+              example:
+                success: true
+                message: "Fingerprint login successful"
+        "400":
+          description: >
+            Bad Request — One or more required fields (`voter_id`, `signature`, `payload`)
+            are missing or null.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "voter_id, signature, and payload are required"
+        "401":
+          description: >
+            Unauthorized — The cryptographic signature is invalid; it does not match
+            the payload when verified against the stored public key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                success: false
+                message: "Fingerprint login failed"
+        "404":
+          description: >
+            Not Found — Either no voter exists with the given `voter_id`, or the voter
+            has not enrolled a fingerprint public key yet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                voter_not_found:
+                  summary: Voter ID does not exist
+                  value:
+                    success: false
+                    message: "Voter not found"
+                no_template:
+                  summary: No fingerprint enrolled for this voter
+                  value:
+                    success: false
+                    message: "No fingerprint registered for this user"
+        "500":
+          description: Internal Server Error — Unexpected database or server failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
