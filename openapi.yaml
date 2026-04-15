@@ -24,13 +24,6 @@ info:
   # contact:
   #   name: Subhankar Ghosh 
   #   email: subhankar.gh24@gmail.com
-  
-
-# servers:
-#   - url: http://127.0.0.1:5000
-#     description: Local Development Server
-#   - url: https://your-production-url.com
-#     description: Production Server (replace with actual URL)
 
 tags:
   - name: GENERAL
