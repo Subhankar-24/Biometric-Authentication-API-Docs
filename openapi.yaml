@@ -311,7 +311,7 @@ paths:
         - AUTHENTICATION
       summary: Register a new voter
       description: >
-        Creates a new voter record in the `voters` MySQL table.
+        Creates a new voter record in the `voters` table.
 
         - **Password storage**: The plaintext password is hashed with **SHA-256** before
           being written to `password_hash`. The plaintext is never stored.
@@ -386,11 +386,6 @@ paths:
         Accepts a Base64-encoded image, extracts a **128-dimensional face encoding**
         using the `face_recognition` library (ResNet50 backbone), serializes it with
         `pickle`, and stores it as a `LONGBLOB` in the `biometric_templates` table.
-
-
-        **Upsert behaviour**: If a face template already exists for the voter, it is
-        **overwritten** with the new encoding. This allows re-enrollment without
-        requiring a delete step.
 
 
         **voter_id resolution**: The endpoint accepts the human-readable string
